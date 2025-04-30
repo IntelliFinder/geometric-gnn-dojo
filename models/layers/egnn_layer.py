@@ -9,7 +9,7 @@ class EGNNLayer(MessagePassing):
 
     Paper: E(n) Equivariant Graph Neural Networks, Satorras et al.
     """
-    def __init__(self, emb_dim, activation="relu", norm="layer", aggr="add"):
+    def __init__(self, emb_dim, proj_dim=10, activation="relu", norm="layer", aggr="add"):
         """
         Args:
             emb_dim: (int) - hidden dimension `d`
@@ -26,7 +26,7 @@ class EGNNLayer(MessagePassing):
 
         # MLP `\psi_h` for computing messages `m_ij`
         self.mlp_msg = Sequential(
-            Linear(2 * emb_dim + 1, emb_dim),
+            Linear(2 * emb_dim + proj_dim + 1, emb_dim),
             self.norm(emb_dim),
             self.activation,
             Linear(emb_dim, emb_dim),
@@ -63,10 +63,11 @@ class EGNNLayer(MessagePassing):
         # Compute messages
         pos_diff = pos_i - pos_j
         dists = torch.norm(pos_diff, dim=-1).unsqueeze(1)
-        msg = torch.cat([h_i, h_j, dists], dim=-1)
+        projectors = pos_i * pos_j
+        msg = torch.cat([h_i, h_j, projectors, dists], dim=-1)
         msg = self.mlp_msg(msg)
         # Scale magnitude of displacement vector
-        pos_diff = pos_diff * self.mlp_pos(msg)
+        pos_diff = pos_j * self.mlp_pos(msg)
         # NOTE: some papers divide pos_diff by (dists + 1) to stabilise model.
         # NOTE: lucidrains clamps pos_diff between some [-n, +n], also for stability.
         return msg, pos_diff
@@ -76,13 +77,13 @@ class EGNNLayer(MessagePassing):
         # Aggregate messages
         msg_aggr = scatter(msgs, index, dim=self.node_dim, reduce=self.aggr)
         # Aggregate displacement vectors
-        pos_aggr = scatter(pos_diffs, index, dim=self.node_dim, reduce="mean")
+        pos_aggr = scatter(pos_diffs, index, dim=self.node_dim, reduce="sum")
         return msg_aggr, pos_aggr
 
     def update(self, aggr_out, h, pos):
         msg_aggr, pos_aggr = aggr_out
         upd_out = self.mlp_upd(torch.cat([h, msg_aggr], dim=-1))
-        upd_pos = pos + pos_aggr
+        upd_pos = pos + pos_aggr*100
         return upd_out, upd_pos
 
     def __repr__(self) -> str:
