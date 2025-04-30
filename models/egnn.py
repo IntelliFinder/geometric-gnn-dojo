@@ -13,14 +13,12 @@ class EGNNModel(torch.nn.Module):
         self,
         num_layers: int = 5,
         emb_dim: int = 128,
-        in_dim: int = 1,
-        out_dim: int = 1,
+        proj_dim: int = 10,
         activation: str = "relu",
         norm: str = "layer",
         aggr: str = "sum",
         pool: str = "sum",
-        residual: bool = True,
-        equivariant_pred: bool = False
+        residual: bool = True
     ):
         """
         Initializes an instance of the EGNNModel class with the provided parameters.
@@ -35,37 +33,21 @@ class EGNNModel(torch.nn.Module):
         - aggr (str): Aggregation method to be used (default: "sum")
         - pool (str): Global pooling method to be used (default: "sum")
         - residual (bool): Whether to use residual connections (default: True)
-        - equivariant_pred (bool): Whether it is an equivariant prediction task (default: False)
         """
         super().__init__()
-        self.equivariant_pred = equivariant_pred
         self.residual = residual
-
-        # Embedding lookup for initial node features
-        self.emb_in = torch.nn.Embedding(in_dim, emb_dim)
 
         # Stack of GNN layers
         self.convs = torch.nn.ModuleList()
         for _ in range(num_layers):
-            self.convs.append(EGNNLayer(emb_dim, activation, norm, aggr))
+            self.convs.append(EGNNLayer(emb_dim, proj_dim, activation, norm, aggr))
 
         # Global pooling/readout function
         self.pool = {"mean": global_mean_pool, "sum": global_add_pool}[pool]
 
-        if self.equivariant_pred:
-            # Linear predictor for equivariant tasks using geometric features
-            self.pred = torch.nn.Linear(emb_dim + 3, out_dim)
-        else:
-            # MLP predictor for invariant tasks using only scalar features
-            self.pred = torch.nn.Sequential(
-                torch.nn.Linear(emb_dim, emb_dim),
-                torch.nn.ReLU(),
-                torch.nn.Linear(emb_dim, out_dim)
-            )
-
     def forward(self, batch):
-        
-        h = self.emb_in(batch.atoms)  # (n,) -> (n, d)
+        batch = batch.to(self.convs[0].mlp_msg[0].weight.device)
+        h = batch.x.squeeze(1).to(batch.pos.device)  # (n,) -> (n, d)
         pos = batch.pos  # (n, 3)
 
         for conv in self.convs:
@@ -78,10 +60,4 @@ class EGNNModel(torch.nn.Module):
             # Update node coordinates (no residual) (n, 3) -> (n, 3)
             pos = pos_update
     
-        if not self.equivariant_pred:
-            # Select only scalars for invariant prediction
-            out = self.pool(h, batch.batch)  # (n, d) -> (batch_size, d)
-        else:
-            out = self.pool(torch.cat([h, pos], dim=-1), batch.batch)
-            
-        return self.pred(out)  # (batch_size, out_dim)
+        return pos  # (batch_size, out_dim)
