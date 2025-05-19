@@ -11,7 +11,71 @@ from torch_geometric.utils import to_undirected
 import sys
 # Import EGNN model from the original code
 from models.egnn import EGNNModel
+#import OAP
+from oap import oap_sign
 
+
+def normalize_vector(v):
+    """ Normalize vector to unit length and flip sign if sum has negative real part."""
+    norm = torch.norm(v)
+    if norm == 0:
+        raise ValueError("Zero vector cannot be normalized.")
+    v = v / norm
+    return v
+
+def flip_vector(v):
+    return torch.flip(v, dims=[0])
+
+def are_vectors_equal(u, v, tol=1e-6):
+    return torch.allclose(u, v, atol=tol)
+
+def span_eq_under_permutation(u, v):
+    """Check if span{u} = span{σ(v)} for some permutation σ."""
+    u = normalize_vector(u)
+    v = normalize_vector(v)
+
+    s_u, s_v = torch.sum(u), torch.sum(v)
+    #if not torch.isclose(s_u, s_v, atol=1e-6):
+    #    return False
+
+    u_sorted, _ = torch.sort(u)
+    v_sorted, _ = torch.sort(v)
+
+    if torch.isclose(s_u, torch.tensor(0.0, dtype=torch.float64), atol=1e-6):
+        rev_u_sorted = flip_vector(u_sorted)
+        return are_vectors_equal(v_sorted, -rev_u_sorted)
+    return False
+
+def count_uncanonicalizable(eigenvectors):
+    """
+    Count how many column vectors in the eigenvectors matrix are uncanonicalizable.
+    
+    Args:
+        eigenvectors: n x k tensor where each column is an eigenvector
+        
+    Returns:
+        count: The number of uncanonicalizable eigenvectors
+    """
+    # Convert input to tensor if it's not already
+    if not isinstance(eigenvectors, torch.Tensor):
+        eigenvectors = torch.tensor(eigenvectors, dtype=torch.float64)
+    elif eigenvectors.dtype != torch.float64:
+        eigenvectors = eigenvectors.to(torch.float64)
+    
+    # Get dimensions
+    n, k = eigenvectors.shape
+    
+    # Initialize counter
+    uncanonicalizable_count = 0
+    
+    # Check each column vector
+    for i in range(k):
+        v = eigenvectors[:, i]
+        # A vector is uncanonicalizable if span_eq_under_permutation(v, v) is True
+        if span_eq_under_permutation(v, v):
+            uncanonicalizable_count += 1
+        
+    return uncanonicalizable_count
 def orthogonalize(U):
     """
     Orthogonalize a set of linear independent vectors using Gram–Schmidt process.
@@ -151,6 +215,9 @@ def count_canonicalization(pyg_data, egnn_base, k_projectors=10):
     
     E, U = torch.flip(E[:-1], dims=[0]), torch.flip(U[:, :-1], dims=[-1])
     E, U = E[:k_projectors], U[:, :k_projectors]
+    # multiply by the eigenvalues 
+    #print(U, torch.exp(E[:k_projectors]))
+    U = U @ torch.diagflat(torch.exp(E[:k_projectors]))
     pyg_data.pos = U  # Use eigenvectors as node positions
     pyg_data.eigvals = E  # Store eigenvalues
     pyg_data.x = torch.zeros((n, args.in_dim), dtype=torch.long,device=edges.device)  # Dummy node features
@@ -163,7 +230,16 @@ def count_canonicalization(pyg_data, egnn_base, k_projectors=10):
     
     #dataset = [pyg_data]  # Wrap in a list for DataLoader
     #batch = Batch.from_data_list(dataset)
-    pyg_data.edge_index = to_undirected(pyg_data.edge_index)
+    #change to fully connectrd graph
+    edge_index = []
+    for i in range(n):
+        for j in range(n):
+            if i != j:  # Don't include self-loops
+                edge_index.append([i, j])
+    
+    # Convert to tensor and reshape to [2, num_edges]
+    edge_index = torch.tensor(edge_index, dtype=torch.long).t()
+    pyg_data.edge_index = to_undirected(edge_index)
     batch = pyg_data
     # Count unique eigenvalues and their multiplicities
     _, mult = torch.unique(E, return_counts=True)
@@ -175,6 +251,9 @@ def count_canonicalization(pyg_data, egnn_base, k_projectors=10):
     orig_sums = torch.sum(U, dim=0).abs().round(decimals=6)
     non_zeros_orig = torch.count_nonzero(orig_sums[single_ind])
     num_uncan_orig = single_ind.size(0) - non_zeros_orig
+
+    #count true uncanonicalizable eigenvectors
+    num_uncan_true = count_uncanonicalizable(U[:, single_ind])
     
     # If we're just initializing, return early
     if egnn_base is None:
@@ -187,8 +266,7 @@ def count_canonicalization(pyg_data, egnn_base, k_projectors=10):
     non_zeros = torch.count_nonzero(egnn_sums[single_ind])
     num_uncan = single_ind.size(0) - non_zeros
     
-    return num_uncan_orig.item(), num_uncan.item(), len(single_ind), n
-
+    return num_uncan_orig.item(), num_uncan.item(), num_uncan_true, len(single_ind), n
 
 def main():
     # Set defaults using similar arguments as the original code
@@ -239,7 +317,7 @@ def main():
     dataset = dataset[:subset_size]
     
     # Process graphs
-    mols_sign_uncano, epnn_sign_uncano, total_eigvecs, total_nodes = 0, 0, 0, 0
+    mols_sign_uncano, epnn_sign_uncano, uncan_true, total_eigvecs, total_nodes = 0, 0, 0, 0, 0
     
     print(f"Processing {len(dataset)} graphs from ZINC subset...")
     for data in tqdm(dataset):
@@ -249,7 +327,7 @@ def main():
         if data.num_nodes == 0 or data.edge_index.size(1) == 0:
             continue
         # Count canonicalization
-        sign_uncan, epnn_uncan, n_eigvecs, n_nodes = count_canonicalization(
+        sign_uncan, epnn_uncan, num_uncan_true, n_eigvecs, n_nodes = count_canonicalization(
             data, egnn_base, k_projectors=args.k_projectors
         )
         #except Exception as e:
@@ -258,15 +336,17 @@ def main():
 
         mols_sign_uncano += sign_uncan
         epnn_sign_uncano += epnn_uncan
+        uncan_true += num_uncan_true
         total_eigvecs += n_eigvecs
         total_nodes += n_nodes
     
     # Print results in the same format as the original code
     print("\nResults:")
     print("'%' of sign uncanonicalizable is: " + str(100*mols_sign_uncano/total_eigvecs))
+    print("'%' of true uncanonicalizable is: " + str(100*uncan_true/total_eigvecs))
     print("'%' of EPNN uncanonicalizable is: " + str(100*epnn_sign_uncano/total_eigvecs))
     print("Improvement of EGNN over standard sign: " + str(100*(mols_sign_uncano-epnn_sign_uncano)/total_eigvecs) + "%")
-    
+    print("Improvement of EGNN over true uncanonicalizable: " + str(100*(uncan_true-epnn_sign_uncano)/total_eigvecs) + "%")
     # Create a direct implementation of the sign canonicalization
     def direct_sign_canon(U):
         col_sums = torch.sum(U, dim=0)
@@ -277,26 +357,12 @@ def main():
         return U_canonical
     
 
-    print("\nRecommendation:")
+    print("\Result:")
     if epnn_sign_uncano < mols_sign_uncano:
         print(f"The EGNN approach with {args.k_projectors} direct eigenvalues and projectors improved sign canonicalization.")
-        print("You can use this approach with adjusted parameters.")
     else:
         print(f"The EGNN with {args.k_projectors} direct eigenvalues and projectors did not significantly improve sign canonicalization.")
-        print("Use the direct sign canonicalization approach:")
-        print("""
-def sign_canonicalization(U):
-    # Calculate column-wise sums to determine sign direction
-    col_sums = torch.sum(U, dim=0)
-    col_signs = torch.sign(col_sums)
-    col_signs[col_signs == 0] = 1  # Handle zero sums
-    
-    # Apply sign correction to get canonical form
-    sign_matrix = torch.diag(col_signs)
-    U_canonical = U @ sign_matrix
-    
-    return U_canonical
-        """)
+        
 
 
 if __name__ == "__main__":
